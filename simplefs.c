@@ -62,40 +62,149 @@ static u32 simplefs_checksum(struct simplefs_super_disk *disk_sb)
 	return checksum;
 }
 
-static bool simplefs_is_sb_sector(sector_t sector)
+static void simplefs_get_sb_sectors(u64 *first, u64 *second)
 {
-	return sector == sb_first_sector || sector == sb_second_sector;
+	*first = sb_first_sector;
+	*second = sb_second_sector;
+
+	if (*first > *second)
+		swap(*first, *second);
 }
 
-static bool simplefs_file_touches_sb(sector_t start, u32 sectors)
+static u64 simplefs_count_region_files(u64 start, u64 end, u32 file_sectors)
 {
-	u32 i;
+	if (end <= start)
+		return 0;
 
-	for (i = 0; i < sectors; i++) {
-		if (simplefs_is_sb_sector(start + i))
-			return true;
+	return (end - start) / file_sectors;
+}
+
+static u64 simplefs_count_files(u64 disk_sectors, u32 file_sectors)
+{
+	u64 first;
+	u64 second;
+
+	simplefs_get_sb_sectors(&first, &second);
+
+	return simplefs_count_region_files(0, first, file_sectors) +
+	       simplefs_count_region_files(first + 1, second, file_sectors) +
+	       simplefs_count_region_files(second + 1, disk_sectors,
+					   file_sectors);
+}
+
+static bool simplefs_file_start(struct simplefs_sb_info *sbi, u64 index,
+				sector_t *start_sector)
+{
+	u64 first;
+	u64 second;
+	u64 region_start;
+	u64 region_end;
+	u64 count;
+
+	simplefs_get_sb_sectors(&first, &second);
+
+	region_start = 0;
+	region_end = first;
+	count = simplefs_count_region_files(region_start, region_end,
+					    sbi->file_sectors);
+	if (index < count) {
+		*start_sector = region_start + index * sbi->file_sectors;
+		return true;
+	}
+	index -= count;
+
+	region_start = first + 1;
+	region_end = second;
+	count = simplefs_count_region_files(region_start, region_end,
+					    sbi->file_sectors);
+	if (index < count) {
+		*start_sector = region_start + index * sbi->file_sectors;
+		return true;
+	}
+	index -= count;
+
+	region_start = second + 1;
+	region_end = sbi->disk_sectors;
+	count = simplefs_count_region_files(region_start, region_end,
+					    sbi->file_sectors);
+	if (index < count) {
+		*start_sector = region_start + index * sbi->file_sectors;
+		return true;
 	}
 
 	return false;
 }
 
-static u64 simplefs_count_files(u64 disk_sectors, u32 file_sectors)
+static int simplefs_file_info(struct simplefs_sb_info *sbi, u64 index,
+			      struct simplefs_file_info *info)
 {
-	sector_t sector = 0;
-	u64 count = 0;
+	int len;
 
-	while (sector + file_sectors <= disk_sectors) {
-		if (simplefs_is_sb_sector(sector) ||
-		    simplefs_file_touches_sb(sector, file_sectors)) {
-			sector++;
-			continue;
-		}
+	if (index >= sbi->file_count)
+		return -ENOENT;
 
-		count++;
-		sector += file_sectors;
+	memset(info, 0, sizeof(*info));
+	len = snprintf(info->name, sizeof(info->name), "f%llu",
+		       (unsigned long long)index + 1);
+	if (len < 0 || len > sbi->max_name_len)
+		return -ENAMETOOLONG;
+
+	if (!simplefs_file_start(sbi, index, &info->start_sector))
+		return -EUCLEAN;
+
+	info->sectors = sbi->file_sectors;
+	info->ino = index + 2;
+	return 0;
+}
+
+static bool simplefs_parse_file_index(struct simplefs_sb_info *sbi,
+				      const unsigned char *name, u32 len,
+				      u64 *index)
+{
+	u64 value = 0;
+	u32 i;
+
+	if (len < 2 || len > sbi->max_name_len || name[0] != 'f' ||
+	    name[1] == '0')
+		return false;
+
+	for (i = 1; i < len; i++) {
+		u8 digit;
+
+		if (name[i] < '0' || name[i] > '9')
+			return false;
+
+		digit = name[i] - '0';
+		if (value > (U64_MAX - digit) / 10)
+			return false;
+		value = value * 10 + digit;
 	}
 
-	return count;
+	if (!value || value > sbi->file_count)
+		return false;
+
+	*index = value - 1;
+	return true;
+}
+
+static int simplefs_validate_files(struct simplefs_sb_info *sbi)
+{
+	struct simplefs_file_info info;
+	u64 expected_count;
+
+	if (!sbi->file_sectors || sbi->max_name_len < 2 ||
+	    sbi->max_name_len > NAME_MAX)
+		return -EINVAL;
+
+	expected_count = simplefs_count_files(sbi->disk_sectors,
+					      sbi->file_sectors);
+	if (sbi->file_count != expected_count)
+		return -EUCLEAN;
+
+	if (!sbi->file_count)
+		return 0;
+
+	return simplefs_file_info(sbi, sbi->file_count - 1, &info);
 }
 
 static int simplefs_read_super_copy(struct super_block *sb, sector_t sector,
@@ -202,42 +311,11 @@ static int simplefs_load_super(struct super_block *sb,
 	sbi->file_sectors = le32_to_cpu(sbi->disk_super.file_sectors);
 	sbi->max_name_len = le32_to_cpu(sbi->disk_super.max_name_len);
 
+	ret = simplefs_validate_files(sbi);
+
 out:
 	kfree(second);
 	return ret;
-}
-
-static int simplefs_build_files(struct simplefs_sb_info *sbi)
-{
-	sector_t sector = 0;
-	u64 i = 0;
-
-	sbi->files = kcalloc(sbi->file_count, sizeof(*sbi->files), GFP_KERNEL);
-	if (!sbi->files && sbi->file_count)
-		return -ENOMEM;
-
-	while (sector + sbi->file_sectors <= sbi->disk_sectors &&
-	       i < sbi->file_count) {
-		if (simplefs_is_sb_sector(sector) ||
-		    simplefs_file_touches_sb(sector, sbi->file_sectors)) {
-			sector++;
-			continue;
-		}
-
-		if (snprintf(sbi->files[i].name, sizeof(sbi->files[i].name),
-			     "f%llu", (unsigned long long)i + 1) >
-		    sbi->max_name_len)
-			return -ENAMETOOLONG;
-
-		sbi->files[i].start_sector = sector;
-		sbi->files[i].sectors = sbi->file_sectors;
-		sbi->files[i].ino = i + 2;
-
-		i++;
-		sector += sbi->file_sectors;
-	}
-
-	return i == sbi->file_count ? 0 : -EUCLEAN;
 }
 
 static struct inode *simplefs_get_inode(struct super_block *sb, umode_t mode,
@@ -272,26 +350,27 @@ static struct dentry *simplefs_lookup(struct inode *dir, struct dentry *dentry,
 				      unsigned int flags)
 {
 	struct simplefs_sb_info *sbi = dir->i_sb->s_fs_info;
-	u64 i;
+	struct simplefs_file_info info;
+	struct inode *inode;
+	u64 index;
+	int ret;
 
-	for (i = 0; i < sbi->file_count; i++) {
-		if (dentry->d_name.len == strlen(sbi->files[i].name) &&
-		    !memcmp(dentry->d_name.name, sbi->files[i].name,
-			    dentry->d_name.len)) {
-			struct inode *inode;
-
-			inode = simplefs_get_inode(dir->i_sb, S_IFREG | 0666,
-						   sbi->files[i].ino);
-			if (!inode)
-				return ERR_PTR(-ENOMEM);
-
-			inode->i_private = &sbi->files[i];
-			d_add(dentry, inode);
-			return NULL;
-		}
+	if (sbi->erased ||
+	    !simplefs_parse_file_index(sbi, dentry->d_name.name,
+				       dentry->d_name.len, &index)) {
+		d_add(dentry, NULL);
+		return NULL;
 	}
 
-	d_add(dentry, NULL);
+	ret = simplefs_file_info(sbi, index, &info);
+	if (ret)
+		return ERR_PTR(ret);
+
+	inode = simplefs_get_inode(dir->i_sb, S_IFREG | 0666, info.ino);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	d_add(dentry, inode);
 	return NULL;
 }
 
@@ -303,10 +382,21 @@ static int simplefs_iterate(struct file *file, struct dir_context *ctx)
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
-	for (i = ctx->pos - 2; i < sbi->file_count; i++) {
-		struct simplefs_file_info *info = &sbi->files[i];
+	if (sbi->erased)
+		return 0;
 
-		if (!dir_emit(ctx, info->name, strlen(info->name), info->ino,
+	if (ctx->pos < 2)
+		ctx->pos = 2;
+
+	for (i = ctx->pos - 2; i < sbi->file_count; i++) {
+		struct simplefs_file_info info;
+		int ret;
+
+		ret = simplefs_file_info(sbi, i, &info);
+		if (ret)
+			return ret;
+
+		if (!dir_emit(ctx, info.name, strlen(info.name), info.ino,
 			      DT_REG))
 			return 0;
 
@@ -320,20 +410,36 @@ static ssize_t simplefs_read(struct file *file, char __user *buf, size_t len,
 			     loff_t *ppos)
 {
 	struct inode *inode = file_inode(file);
-	struct simplefs_file_info *info = inode->i_private;
-	loff_t file_size = (loff_t)info->sectors * SIMPLEFS_SECTOR_SIZE;
+	struct simplefs_sb_info *sbi = inode->i_sb->s_fs_info;
+	struct simplefs_file_info info;
+	loff_t file_size;
+	loff_t available;
 	size_t copied = 0;
+	int ret;
 
+	if (sbi->erased)
+		return -ENODEV;
+	if (*ppos < 0)
+		return -EINVAL;
+	if (inode->i_ino < 2)
+		return -EUCLEAN;
+
+	ret = simplefs_file_info(sbi, inode->i_ino - 2, &info);
+	if (ret)
+		return ret;
+
+	file_size = (loff_t)info.sectors * SIMPLEFS_SECTOR_SIZE;
 	if (*ppos >= file_size)
 		return 0;
 
-	if (len > file_size - *ppos)
-		len = file_size - *ppos;
+	available = file_size - *ppos;
+	if (len > (size_t)available)
+		len = (size_t)available;
 
 	while (copied < len) {
 		struct buffer_head *bh;
 		loff_t pos = *ppos;
-		sector_t sector = info->start_sector + pos / SIMPLEFS_SECTOR_SIZE;
+		sector_t sector = info.start_sector + pos / SIMPLEFS_SECTOR_SIZE;
 		unsigned int offset = pos % SIMPLEFS_SECTOR_SIZE;
 		size_t part = min_t(size_t, len - copied,
 				    SIMPLEFS_SECTOR_SIZE - offset);
@@ -359,20 +465,38 @@ static ssize_t simplefs_write(struct file *file, const char __user *buf,
 			      size_t len, loff_t *ppos)
 {
 	struct inode *inode = file_inode(file);
-	struct simplefs_file_info *info = inode->i_private;
-	loff_t file_size = (loff_t)info->sectors * SIMPLEFS_SECTOR_SIZE;
+	struct simplefs_sb_info *sbi = inode->i_sb->s_fs_info;
+	struct simplefs_file_info info;
+	loff_t file_size;
+	loff_t available;
 	size_t copied = 0;
+	int ret;
 
-	if (*ppos >= file_size)
+	if (sbi->erased)
+		return -ENODEV;
+	if (!len)
 		return 0;
+	if (*ppos < 0)
+		return -EINVAL;
+	if (inode->i_ino < 2)
+		return -EUCLEAN;
 
-	if (len > file_size - *ppos)
-		len = file_size - *ppos;
+	ret = simplefs_file_info(sbi, inode->i_ino - 2, &info);
+	if (ret)
+		return ret;
+
+	file_size = (loff_t)info.sectors * SIMPLEFS_SECTOR_SIZE;
+	if (*ppos >= file_size)
+		return -ENOSPC;
+
+	available = file_size - *ppos;
+	if (len > (size_t)available)
+		len = (size_t)available;
 
 	while (copied < len) {
 		struct buffer_head *bh;
 		loff_t pos = *ppos;
-		sector_t sector = info->start_sector + pos / SIMPLEFS_SECTOR_SIZE;
+		sector_t sector = info.start_sector + pos / SIMPLEFS_SECTOR_SIZE;
 		unsigned int offset = pos % SIMPLEFS_SECTOR_SIZE;
 		size_t part = min_t(size_t, len - copied,
 				    SIMPLEFS_SECTOR_SIZE - offset);
@@ -441,7 +565,13 @@ static int simplefs_zero_files(struct super_block *sb)
 	int ret;
 
 	for (i = 0; i < sbi->file_count; i++) {
-		ret = simplefs_zero_file(sb, &sbi->files[i]);
+		struct simplefs_file_info info;
+
+		ret = simplefs_file_info(sbi, i, &info);
+		if (ret)
+			return ret;
+
+		ret = simplefs_zero_file(sb, &info);
 		if (ret)
 			return ret;
 	}
@@ -483,17 +613,22 @@ static long simplefs_ioctl_hashes(struct super_block *sb, unsigned long arg)
 		return -EFAULT;
 
 	entries = (struct simplefs_ioctl_hash_entry __user *)(unsigned long)req.entries;
-	req.count = (u32)sbi->file_count;
+	req.count = sbi->file_count > U32_MAX ? U32_MAX : (u32)sbi->file_count;
 
 	for (i = 0; i < sbi->file_count && i < req.capacity; i++) {
 		struct simplefs_ioctl_hash_entry entry;
+		struct simplefs_file_info info;
+
+		ret = simplefs_file_info(sbi, i, &info);
+		if (ret)
+			return ret;
 
 		memset(&entry, 0, sizeof(entry));
-		snprintf(entry.name, sizeof(entry.name), "%s", sbi->files[i].name);
-		entry.start_sector = sbi->files[i].start_sector;
-		entry.sectors = sbi->files[i].sectors;
+		snprintf(entry.name, sizeof(entry.name), "%s", info.name);
+		entry.start_sector = info.start_sector;
+		entry.sectors = info.sectors;
 
-		ret = simplefs_hash_file(sb, &sbi->files[i], &entry.hash);
+		ret = simplefs_hash_file(sb, &info, &entry.hash);
 		if (ret)
 			return ret;
 
@@ -511,28 +646,32 @@ static long simplefs_ioctl_mapping(struct super_block *sb, unsigned long arg)
 {
 	struct simplefs_sb_info *sbi = sb->s_fs_info;
 	struct simplefs_ioctl_mapping map;
-	u64 i;
+	struct simplefs_file_info info;
+	size_t len;
+	u64 index;
+	int ret;
 
 	if (copy_from_user(&map, (void __user *)arg, sizeof(map)))
 		return -EFAULT;
 
 	map.name[NAME_MAX] = '\0';
+	len = strnlen(map.name, sizeof(map.name));
+	if (!simplefs_parse_file_index(sbi, (unsigned char *)map.name, len,
+				       &index))
+		return -ENOENT;
 
-	for (i = 0; i < sbi->file_count; i++) {
-		if (strcmp(map.name, sbi->files[i].name))
-			continue;
+	ret = simplefs_file_info(sbi, index, &info);
+	if (ret)
+		return ret;
 
-		map.start_sector = sbi->files[i].start_sector;
-		map.sectors = sbi->files[i].sectors;
-		map.reserved = 0;
+	map.start_sector = info.start_sector;
+	map.sectors = info.sectors;
+	map.reserved = 0;
 
-		if (copy_to_user((void __user *)arg, &map, sizeof(map)))
-			return -EFAULT;
+	if (copy_to_user((void __user *)arg, &map, sizeof(map)))
+		return -EFAULT;
 
-		return 0;
-	}
-
-	return -ENOENT;
+	return 0;
 }
 
 static long simplefs_ioctl(struct file *file, unsigned int cmd,
@@ -542,10 +681,16 @@ static long simplefs_ioctl(struct file *file, unsigned int cmd,
 	struct simplefs_sb_info *sbi = sb->s_fs_info;
 	int ret;
 
+	if (sbi->erased && cmd != SIMPLEFS_IOCTL_ERASE)
+		return -ENODEV;
+
 	switch (cmd) {
 	case SIMPLEFS_IOCTL_ZERO:
 		return simplefs_zero_files(sb);
 	case SIMPLEFS_IOCTL_ERASE:
+		if (sbi->erased)
+			return -ENODEV;
+
 		ret = simplefs_zero_files(sb);
 		if (ret)
 			return ret;
@@ -554,8 +699,13 @@ static long simplefs_ioctl(struct file *file, unsigned int cmd,
 		if (ret)
 			return ret;
 
-		return simplefs_zero_sector(sb,
-					    le64_to_cpu(sbi->disk_super.sb_second_sector));
+		ret = simplefs_zero_sector(sb,
+					   le64_to_cpu(sbi->disk_super.sb_second_sector));
+		if (ret)
+			return ret;
+
+		sbi->erased = true;
+		return 0;
 	case SIMPLEFS_IOCTL_HASHES:
 		return simplefs_ioctl_hashes(sb, arg);
 	case SIMPLEFS_IOCTL_MAPPING:
@@ -569,7 +719,6 @@ static void simplefs_put_super(struct super_block *sb)
 {
 	struct simplefs_sb_info *sbi = sb->s_fs_info;
 
-	kfree(sbi->files);
 	kfree(sbi);
 }
 
@@ -603,10 +752,6 @@ static int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	if (ret)
 		goto fail;
 
-	ret = simplefs_build_files(sbi);
-	if (ret)
-		goto fail;
-
 	root = simplefs_get_inode(sb, S_IFDIR | 0755, 1);
 	if (!root) {
 		ret = -ENOMEM;
@@ -622,7 +767,6 @@ static int simplefs_fill_super(struct super_block *sb, void *data, int silent)
 	return 0;
 
 fail:
-	kfree(sbi->files);
 	kfree(sbi);
 	sb->s_fs_info = NULL;
 	return ret;

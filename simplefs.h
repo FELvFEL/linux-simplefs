@@ -61,11 +61,11 @@ struct simplefs_file_info {
 
 struct simplefs_sb_info {
 	struct simplefs_super_disk disk_super;
-	struct simplefs_file_info *files;
 	u64 file_count;
 	u64 disk_sectors;
 	u32 max_name_len;
 	u32 file_sectors;
+	bool erased;
 };
 
 #endif
